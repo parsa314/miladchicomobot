@@ -1,4 +1,4 @@
-name: v0.50 Deployment Shell Smoke
+name: v0.50 Public Release Gate
 
 on:
   push:
@@ -8,30 +8,146 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: v050-public-release-gate-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  smoke:
+  release-gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.11'
           cache: pip
-      - run: |
+
+      - name: Install and verify runtime dependencies
+        run: |
+          set -euo pipefail
+          python --version
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest httpx
-      - name: Smoke tests
+          python -m pip install -r requirements.txt pytest httpx
+          python -m pip check
+          python - <<'PY'
+          import fastapi, uvicorn, httpx
+          print('fastapi', fastapi.__version__)
+          print('uvicorn', uvicorn.__version__)
+          print('httpx', httpx.__version__)
+          PY
+          python -m pip freeze | sort > /tmp/resolved-requirements.txt
+
+      - name: Verify Railway config contract
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          cfg = tomllib.loads(Path('railway.toml').read_text())
+          assert cfg['build']['builder'] == 'RAILPACK'
+          assert cfg['deploy']['startCommand'] == 'uvicorn app:app --host 0.0.0.0 --port $PORT'
+          assert cfg['deploy']['healthcheckPath'] == '/health'
+          assert int(cfg['deploy']['healthcheckTimeout']) == 120
+          assert cfg['deploy']['restartPolicyType'] == 'ON_FAILURE'
+          assert int(cfg['deploy']['restartPolicyMaxRetries']) == 3
+          print('Railway config contract: PASS')
+          PY
+
+      - name: Unit smoke tests
         env:
           LIVE_EXECUTION: 'false'
           PAPER_EXECUTION: 'false'
           BOT_FORWARD_PAPER_ENABLED: 'false'
           BOT_PAPER_EXECUTION_ENABLED: 'false'
         run: pytest -q test_app.py
-      - name: Verify fail-closed startup guard
+
+      - name: Verify all fail-closed startup guards
         run: |
-          set +e
-          LIVE_EXECUTION=true python -c 'import app' >/tmp/out 2>/tmp/err
-          code=$?
-          set -e
-          test "$code" -ne 0
-          grep -q 'Execution firewall violation' /tmp/err
+          set -euo pipefail
+          flags=(LIVE_EXECUTION PAPER_EXECUTION BOT_FORWARD_PAPER_ENABLED BOT_PAPER_EXECUTION_ENABLED)
+          for flag in "${flags[@]}"; do
+            echo "Testing firewall flag: ${flag}=true"
+            set +e
+            env \
+              LIVE_EXECUTION=false \
+              PAPER_EXECUTION=false \
+              BOT_FORWARD_PAPER_ENABLED=false \
+              BOT_PAPER_EXECUTION_ENABLED=false \
+              "${flag}=true" \
+              python -c 'import app' >"/tmp/${flag}.out" 2>"/tmp/${flag}.err"
+            code=$?
+            set -e
+            test "$code" -ne 0
+            grep -q 'Execution firewall violation' "/tmp/${flag}.err"
+          done
+          echo 'All four startup firewall flags: PASS'
+
+      - name: End-to-end Uvicorn and HTTP release probe
+        env:
+          LIVE_EXECUTION: 'false'
+          PAPER_EXECUTION: 'false'
+          BOT_FORWARD_PAPER_ENABLED: 'false'
+          BOT_PAPER_EXECUTION_ENABLED: 'false'
+          BOT_RELEASE_CHANNEL: 'research-v50-fail-closed'
+        run: |
+          set -euo pipefail
+          export PORT=8765
+          python -m uvicorn app:app --host 127.0.0.1 --port "$PORT" >/tmp/uvicorn.log 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          python - <<'PY'
+          import time
+          import httpx
+
+          base = 'http://127.0.0.1:8765'
+          last_error = None
+          for _ in range(40):
+              try:
+                  r = httpx.get(base + '/health', timeout=1.0)
+                  if r.status_code == 200:
+                      break
+              except Exception as exc:
+                  last_error = exc
+              time.sleep(0.25)
+          else:
+              raise RuntimeError(f'Uvicorn health probe failed: {last_error!r}')
+
+          health = httpx.get(base + '/health', timeout=2.0)
+          health.raise_for_status()
+          h = health.json()
+          assert h['status'] == 'ok'
+          assert h['version'] == '1.0.0-rc3'
+          assert h['execution_mode'] == 'RESEARCH_ONLY'
+          assert h['latest_completed_experiment'] == 'v0.50'
+          assert h['paper_execution'] is False
+          assert h['live_execution'] is False
+          assert h['kraken_holdout'] == 'SEALED'
+
+          status = httpx.get(base + '/research/status', timeout=2.0)
+          status.raise_for_status()
+          s = status.json()
+          assert s['latest_completed_decision'] == 'V50_NONOVERLAP_FAILURE_SUPPORTED'
+          assert s['candidate_promotion_allowed'] is False
+          assert s['v50_provenance']['workflow_run'] == 34707823108
+          assert s['v50_provenance']['scientific_head'] == '1dd0b1fe506fc51ceec4ff8934b77090f86b6cc2'
+          assert s['v50_provenance']['artifact_id'] == 10302830689
+          assert s['v50_provenance']['artifact_digest'] == 'sha256:da5813a8c031f9da6cc940fda942efc846ca536dbd952f4930584c30732373e9'
+
+          decision = httpx.post(base + '/decision/evaluate', json={}, timeout=2.0)
+          assert decision.status_code == 423
+          paper = httpx.post(base + '/paper/run-once', timeout=2.0)
+          assert paper.status_code == 423
+          print('End-to-end Uvicorn/HTTP release probe: PASS')
+          PY
+
+          test -s /tmp/uvicorn.log
