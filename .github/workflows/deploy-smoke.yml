@@ -15,7 +15,7 @@ concurrency:
 jobs:
   release-gate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -31,13 +31,37 @@ jobs:
           set -euo pipefail
           python --version
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pytest httpx
+          python -m pip install -r requirements.txt 'pytest>=8,<10' 'httpx>=0.27,<1'
           python -m pip check
+          python -m compileall -q app.py test_app.py
           python - <<'PY'
-          import fastapi, uvicorn, httpx
-          print('fastapi', fastapi.__version__)
-          print('uvicorn', uvicorn.__version__)
-          print('httpx', httpx.__version__)
+          import ccxt
+          import fastapi
+          import httpx
+          import numpy
+          import pandas
+          import psycopg
+          import sklearn
+          import uvicorn
+
+          versions = {
+              'ccxt': ccxt.__version__,
+              'fastapi': fastapi.__version__,
+              'httpx': httpx.__version__,
+              'numpy': numpy.__version__,
+              'pandas': pandas.__version__,
+              'psycopg': psycopg.__version__,
+              'scikit-learn': sklearn.__version__,
+              'uvicorn': uvicorn.__version__,
+          }
+          for name, version in versions.items():
+              print(f'{name} {version}')
+
+          # Constructor-only smoke checks: no credentials and no orders.
+          assert ccxt.coinex().id == 'coinex'
+          assert ccxt.okx().id == 'okx'
+          assert ccxt.kucoin().id == 'kucoin'
+          print('Runtime dependency import/constructor checks: PASS')
           PY
           python -m pip freeze | sort > /tmp/resolved-requirements.txt
 
