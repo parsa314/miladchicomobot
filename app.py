@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# Railway source-refresh marker: 2026-09-13. Functional behavior intentionally unchanged.
 import os
 from datetime import datetime, timezone
 
